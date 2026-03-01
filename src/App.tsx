@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { GoogleGenAI } from '@google/genai';
-import { Code2, Play, Copy, Check, AlertCircle, Settings2, Braces, ListTree, Video, Search, Image as ImageIcon, Film } from 'lucide-react';
+import { Code2, Play, Copy, Check, AlertCircle, Settings2, Braces, ListTree, Video, Search, Image as ImageIcon, Film, Sparkles, Loader2 } from 'lucide-react';
 import ReactPlayer from 'react-player';
 
 declare global {
@@ -102,23 +102,25 @@ export default function App() {
   const [videoUrl, setVideoUrl] = useState('');
   const [schema, setSchema] = useState('{\n  "type": "object",\n  "properties": {\n    "name": { "type": "string" },\n    "publicInfoSummary": { "type": "string" },\n    "imageUrl": { "type": "string", "description": "A valid URL to an image of the entity" }\n  }\n}');
   const [useSchema, setUseSchema] = useState(false);
-  const [output, setOutput] = useState('');
-  const [parsedOutput, setParsedOutput] = useState<any>(null);
-  const [generatedMedia, setGeneratedMedia] = useState<{ type: 'image' | 'video', url: string } | null>(null);
-  const [activeTab, setActiveTab] = useState<'raw' | 'viewer' | 'media'>('raw');
-  const [isLoading, setIsLoading] = useState(false);
+  
+  // State for the 3 concurrent generations
+  const [jsonResult, setJsonResult] = useState<{ data: any; raw: string; isLoading: boolean; error: string }>({ data: null, raw: '', isLoading: false, error: '' });
+  const [imageResult, setImageResult] = useState<{ url: string; isLoading: boolean; error: string }>({ url: '', isLoading: false, error: '' });
+  const [videoResult, setVideoResult] = useState<{ url: string; isLoading: boolean; error: string }>({ url: '', isLoading: false, error: '' });
+
   const [isFindingVideo, setIsFindingVideo] = useState(false);
-  const [error, setError] = useState('');
+  const [globalError, setGlobalError] = useState('');
   const [copied, setCopied] = useState(false);
+  const [jsonViewMode, setJsonViewMode] = useState<'viewer' | 'raw'>('viewer');
 
   const handleFindVideo = async () => {
     if (!videoUrl.trim()) {
-      setError('Please enter a topic to search for in the Video URL field.');
+      setGlobalError('Please enter a topic to search for in the Video URL field.');
       return;
     }
 
     setIsFindingVideo(true);
-    setError('');
+    setGlobalError('');
 
     try {
       const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
@@ -134,7 +136,6 @@ export default function App() {
 
       const text = response.text?.trim();
       if (text && (text.includes('youtube.com') || text.includes('youtu.be'))) {
-        // Extract URL if there's extra text
         const urlMatch = text.match(/(https?:\/\/[^\s]+)/);
         if (urlMatch) {
           setVideoUrl(urlMatch[0]);
@@ -142,27 +143,58 @@ export default function App() {
           setVideoUrl(text);
         }
       } else {
-        setError('Could not find a valid video URL. Please try a different search term.');
+        setGlobalError('Could not find a valid video URL. Please try a different search term.');
       }
     } catch (err: any) {
-      setError(err.message || 'An error occurred while searching for a video.');
+      setGlobalError(err.message || 'An error occurred while searching for a video.');
     } finally {
       setIsFindingVideo(false);
     }
   };
 
-  const handleGenerateImage = async () => {
-    if (!prompt.trim()) {
-      setError('Please enter a prompt.');
-      return;
-    }
-    setIsLoading(true);
-    setError('');
+  const generateJson = async (ai: GoogleGenAI, finalPrompt: string) => {
+    setJsonResult({ data: null, raw: '', isLoading: true, error: '' });
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY as string });
+      let systemInstruction = 'You are a helpful assistant that always responds with valid JSON. Do not include markdown formatting like ```json, just the raw JSON string.\n\nIf the prompt involves real-world entities, people, or places, use Google Search to find accurate public info. Automatically include a relevant high-quality image URL for them (e.g., in an `imageUrl` field).';
+      
+      if (useSchema && schema.trim()) {
+        systemInstruction += `\n\nEnsure the output strictly follows this JSON schema:\n${schema}`;
+      }
+
+      const response = await ai.models.generateContent({
+        model: 'gemini-3-flash-preview',
+        contents: finalPrompt,
+        config: {
+          systemInstruction,
+          responseMimeType: 'application/json',
+          temperature: 0.1,
+          tools: [{ googleSearch: {} }],
+        },
+      });
+
+      if (response.text) {
+        try {
+          const parsed = JSON.parse(response.text);
+          setJsonResult({ data: parsed, raw: JSON.stringify(parsed, null, 2), isLoading: false, error: '' });
+          setJsonViewMode('viewer');
+        } catch (e) {
+          setJsonResult({ data: null, raw: response.text, isLoading: false, error: '' });
+          setJsonViewMode('raw');
+        }
+      } else {
+        setJsonResult(prev => ({ ...prev, isLoading: false, error: 'No response generated.' }));
+      }
+    } catch (err: any) {
+      setJsonResult(prev => ({ ...prev, isLoading: false, error: err.message || 'Failed to generate JSON.' }));
+    }
+  };
+
+  const generateImage = async (ai: GoogleGenAI, promptText: string) => {
+    setImageResult({ url: '', isLoading: true, error: '' });
+    try {
       const response = await ai.models.generateContent({
         model: 'gemini-2.5-flash-image',
-        contents: prompt,
+        contents: promptText,
       });
       
       let imageUrl = null;
@@ -174,25 +206,17 @@ export default function App() {
       }
       
       if (imageUrl) {
-        setGeneratedMedia({ type: 'image', url: imageUrl });
-        setActiveTab('media');
+        setImageResult({ url: imageUrl, isLoading: false, error: '' });
       } else {
-        setError('No image generated.');
+        setImageResult(prev => ({ ...prev, isLoading: false, error: 'No image generated.' }));
       }
     } catch (err: any) {
-      setError(err.message || 'Failed to generate image.');
-    } finally {
-      setIsLoading(false);
+      setImageResult(prev => ({ ...prev, isLoading: false, error: err.message || 'Failed to generate image.' }));
     }
   };
 
-  const handleGenerateVideo = async () => {
-    if (!prompt.trim()) {
-      setError('Please enter a prompt.');
-      return;
-    }
-    setIsLoading(true);
-    setError('');
+  const generateVideo = async (promptText: string) => {
+    setVideoResult({ url: '', isLoading: true, error: '' });
     try {
       if (window.aistudio?.hasSelectedApiKey) {
         const hasKey = await window.aistudio.hasSelectedApiKey();
@@ -209,7 +233,7 @@ export default function App() {
       
       let operation = await ai.models.generateVideos({
         model: 'veo-3.1-fast-generate-preview',
-        prompt: prompt,
+        prompt: promptText,
         config: {
           numberOfVideos: 1,
           resolution: '720p',
@@ -232,101 +256,63 @@ export default function App() {
         });
         const blob = await response.blob();
         const videoUrl = URL.createObjectURL(blob);
-        setGeneratedMedia({ type: 'video', url: videoUrl });
-        setActiveTab('media');
+        setVideoResult({ url: videoUrl, isLoading: false, error: '' });
       } else {
-        setError('No video generated.');
+        setVideoResult(prev => ({ ...prev, isLoading: false, error: 'No video generated.' }));
       }
     } catch (err: any) {
-      setError(err.message || 'Failed to generate video.');
-    } finally {
-      setIsLoading(false);
+      setVideoResult(prev => ({ ...prev, isLoading: false, error: err.message || 'Failed to generate video.' }));
     }
   };
 
-  const handleGenerate = async () => {
+  const handleGenerateMagic = async () => {
     if (!prompt.trim()) {
-      setError('Please enter a prompt.');
+      setGlobalError('Please enter a prompt.');
       return;
     }
 
-    setIsLoading(true);
-    setError('');
-    setOutput('');
-    setParsedOutput(null);
-
-    try {
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-      
-      let systemInstruction = 'You are a helpful assistant that always responds with valid JSON. Do not include markdown formatting like ```json, just the raw JSON string.\n\nIf the prompt involves real-world entities, people, or places, use Google Search to find accurate public info. Automatically include a relevant high-quality image URL for them (e.g., in an `imageUrl` field).';
-      
-      if (useSchema && schema.trim()) {
-        systemInstruction += `\n\nEnsure the output strictly follows this JSON schema:\n${schema}`;
-      }
-
-      let finalPrompt = prompt;
-      if (videoUrl.trim()) {
-        finalPrompt = `Video URL: ${videoUrl}\n\n${prompt}`;
-      }
-
-      const response = await ai.models.generateContent({
-        model: 'gemini-3-flash-preview',
-        contents: finalPrompt,
-        config: {
-          systemInstruction,
-          responseMimeType: 'application/json',
-          temperature: 0.1,
-          tools: [{ googleSearch: {} }],
-        },
-      });
-
-      if (response.text) {
-        try {
-          // Try to parse and re-stringify to ensure it's pretty-printed and valid
-          const parsed = JSON.parse(response.text);
-          setOutput(JSON.stringify(parsed, null, 2));
-          setParsedOutput(parsed);
-          setActiveTab('viewer');
-        } catch (e) {
-          // If parsing fails, just show the raw text
-          setOutput(response.text);
-          setParsedOutput(null);
-          setActiveTab('raw');
-        }
-      } else {
-        setError('No response generated.');
-      }
-    } catch (err: any) {
-      setError(err.message || 'An error occurred while generating JSON.');
-    } finally {
-      setIsLoading(false);
+    setGlobalError('');
+    
+    let finalPrompt = prompt;
+    if (videoUrl.trim()) {
+      finalPrompt = `Video URL: ${videoUrl}\n\n${prompt}`;
     }
+
+    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY as string });
+
+    // Fire all 3 concurrently
+    generateJson(ai, finalPrompt);
+    generateImage(ai, prompt);
+    generateVideo(prompt);
   };
 
-  const handleCopy = () => {
-    if (!output) return;
-    navigator.clipboard.writeText(output);
+  const handleCopyJson = () => {
+    if (!jsonResult.raw) return;
+    navigator.clipboard.writeText(jsonResult.raw);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
 
+  const isAnyLoading = jsonResult.isLoading || imageResult.isLoading || videoResult.isLoading;
+  const hasAnyResult = jsonResult.raw || imageResult.url || videoResult.url;
+
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-100 font-sans flex flex-col">
       {/* Header */}
-      <header className="border-b border-zinc-800 bg-zinc-900/50 p-4 flex items-center justify-between">
+      <header className="border-b border-zinc-800 bg-zinc-900/50 p-4 flex items-center justify-between z-10">
         <div className="flex items-center gap-2">
           <div className="p-2 bg-indigo-500/20 rounded-lg text-indigo-400">
-            <Code2 size={20} />
+            <Sparkles size={20} />
           </div>
-          <h1 className="text-xl font-semibold tracking-tight">Prompt to JSON</h1>
+          <h1 className="text-xl font-semibold tracking-tight">AI Magic Workflow</h1>
         </div>
       </header>
 
       {/* Main Content */}
-      <main className="flex-1 grid grid-cols-1 lg:grid-cols-2 gap-px bg-zinc-800 overflow-hidden">
+      <main className="flex-1 grid grid-cols-1 lg:grid-cols-12 gap-px bg-zinc-800 overflow-hidden">
         
-        {/* Left Panel: Input */}
-        <div className="bg-zinc-950 p-6 flex flex-col gap-6 overflow-y-auto">
+        {/* Left Panel: Input (4 columns) */}
+        <div className="bg-zinc-950 p-6 flex flex-col gap-6 overflow-y-auto lg:col-span-4">
           
           <div className="flex flex-col gap-2">
             <label className="text-sm font-medium text-zinc-400 flex items-center gap-2">
@@ -347,7 +333,7 @@ export default function App() {
                 className="px-4 bg-zinc-800 hover:bg-zinc-700 disabled:opacity-50 text-zinc-300 rounded-xl text-sm font-medium flex items-center gap-2 transition-colors whitespace-nowrap"
               >
                 {isFindingVideo ? (
-                  <div className="w-4 h-4 border-2 border-zinc-400 border-t-transparent rounded-full animate-spin" />
+                  <Loader2 size={16} className="animate-spin" />
                 ) : (
                   <Search size={16} />
                 )}
@@ -405,140 +391,169 @@ export default function App() {
               value={schema}
               onChange={(e) => setSchema(e.target.value)}
               disabled={!useSchema}
-              className={`w-full flex-1 min-h-[200px] bg-zinc-900 border border-zinc-800 rounded-xl p-4 text-zinc-100 font-mono text-sm resize-none focus:outline-none focus:ring-2 focus:ring-indigo-500/50 ${!useSchema ? 'opacity-50 cursor-not-allowed' : ''}`}
+              className={`w-full flex-1 min-h-[150px] bg-zinc-900 border border-zinc-800 rounded-xl p-4 text-zinc-100 font-mono text-sm resize-none focus:outline-none focus:ring-2 focus:ring-indigo-500/50 ${!useSchema ? 'opacity-50 cursor-not-allowed' : ''}`}
             />
           </div>
 
           <button
-            onClick={handleGenerate}
-            disabled={isLoading}
-            className="w-full py-3 px-4 bg-indigo-600 hover:bg-indigo-500 disabled:bg-indigo-600/50 disabled:cursor-not-allowed text-white rounded-xl font-medium flex items-center justify-center gap-2 transition-colors"
+            onClick={handleGenerateMagic}
+            disabled={isAnyLoading}
+            className="w-full py-4 px-4 bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-xl font-bold flex items-center justify-center gap-2 transition-all shadow-lg shadow-indigo-500/20"
           >
-            {isLoading ? (
-              <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+            {isAnyLoading ? (
+              <Loader2 size={20} className="animate-spin" />
             ) : (
               <>
-                <Play size={18} fill="currentColor" />
-                Generate JSON
+                <Sparkles size={20} />
+                Automate Workflow
               </>
             )}
           </button>
-          
-          <div className="grid grid-cols-2 gap-2">
-            <button
-              onClick={handleGenerateImage}
-              disabled={isLoading}
-              className="w-full py-3 px-4 bg-zinc-800 hover:bg-zinc-700 disabled:bg-zinc-800/50 disabled:cursor-not-allowed text-zinc-100 rounded-xl font-medium flex items-center justify-center gap-2 transition-colors"
-            >
-              {isLoading ? <div className="w-4 h-4 border-2 border-zinc-400 border-t-transparent rounded-full animate-spin" /> : <ImageIcon size={18} />}
-              Generate Image
-            </button>
-            <button
-              onClick={handleGenerateVideo}
-              disabled={isLoading}
-              className="w-full py-3 px-4 bg-zinc-800 hover:bg-zinc-700 disabled:bg-zinc-800/50 disabled:cursor-not-allowed text-zinc-100 rounded-xl font-medium flex items-center justify-center gap-2 transition-colors"
-            >
-              {isLoading ? <div className="w-4 h-4 border-2 border-zinc-400 border-t-transparent rounded-full animate-spin" /> : <Film size={18} />}
-              Generate Video
-            </button>
-          </div>
 
-          {error && (
+          {globalError && (
             <div className="p-4 bg-red-500/10 border border-red-500/20 rounded-xl flex items-start gap-3 text-red-400 text-sm">
               <AlertCircle size={18} className="shrink-0 mt-0.5" />
-              <p>{error}</p>
+              <p>{globalError}</p>
             </div>
           )}
         </div>
 
-        {/* Right Panel: Output */}
-        <div className="bg-zinc-950 p-6 flex flex-col gap-4">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-1 bg-zinc-900 p-1 rounded-lg border border-zinc-800">
-              <button
-                onClick={() => setActiveTab('viewer')}
-                disabled={!parsedOutput}
-                className={`px-3 py-1.5 rounded-md text-xs font-medium flex items-center gap-2 transition-colors ${
-                  activeTab === 'viewer' 
-                    ? 'bg-zinc-800 text-zinc-100 shadow-sm' 
-                    : 'text-zinc-500 hover:text-zinc-300 disabled:opacity-50 disabled:cursor-not-allowed'
-                }`}
-              >
-                <ListTree size={14} />
-                JSON Viewer
-              </button>
-              <button
-                onClick={() => setActiveTab('raw')}
-                className={`px-3 py-1.5 rounded-md text-xs font-medium flex items-center gap-2 transition-colors ${
-                  activeTab === 'raw' 
-                    ? 'bg-zinc-800 text-zinc-100 shadow-sm' 
-                    : 'text-zinc-500 hover:text-zinc-300'
-                }`}
-              >
-                <Braces size={14} />
-                Raw JSON
-              </button>
-              <button
-                onClick={() => setActiveTab('media')}
-                disabled={!generatedMedia}
-                className={`px-3 py-1.5 rounded-md text-xs font-medium flex items-center gap-2 transition-colors ${
-                  activeTab === 'media' 
-                    ? 'bg-zinc-800 text-zinc-100 shadow-sm' 
-                    : 'text-zinc-500 hover:text-zinc-300 disabled:opacity-50 disabled:cursor-not-allowed'
-                }`}
-              >
-                <ImageIcon size={14} />
-                Media
-              </button>
+        {/* Right Panel: Results Dashboard (8 columns) */}
+        <div className="bg-zinc-950 p-6 overflow-y-auto lg:col-span-8">
+          {!hasAnyResult && !isAnyLoading ? (
+            <div className="h-full flex flex-col items-center justify-center text-zinc-500 gap-4">
+              <Sparkles size={48} className="text-zinc-800" />
+              <p>Enter a prompt and click "Automate Workflow" to generate JSON, Image, and Video simultaneously.</p>
             </div>
-            <button
-              onClick={handleCopy}
-              disabled={!output}
-              className="p-2 text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2 text-xs font-medium"
-            >
-              {copied ? <Check size={16} className="text-emerald-400" /> : <Copy size={16} />}
-              {copied ? 'Copied!' : 'Copy'}
-            </button>
-          </div>
-          
-          <div className="flex-1 bg-[#0d0d0d] border border-zinc-800 rounded-xl overflow-hidden relative group">
-            {activeTab === 'media' && generatedMedia ? (
-              <div className="absolute inset-0 flex items-center justify-center p-6 bg-black">
-                {generatedMedia.type === 'image' ? (
-                  <img src={generatedMedia.url} alt="Generated" className="max-w-full max-h-full object-contain rounded-lg" />
-                ) : (
-                  <video src={generatedMedia.url} controls autoPlay className="max-w-full max-h-full rounded-lg" />
-                )}
-              </div>
-            ) : output ? (
-              <>
-                {activeTab === 'raw' ? (
-                  <textarea
-                    value={output}
-                    onChange={(e) => {
-                      setOutput(e.target.value);
-                      try {
-                        const parsed = JSON.parse(e.target.value);
-                        setParsedOutput(parsed);
-                      } catch (err) {
-                        // ignore parse errors while typing
-                      }
-                    }}
-                    className="absolute inset-0 w-full h-full p-6 bg-transparent text-sm font-mono text-zinc-300 resize-none focus:outline-none"
-                    spellCheck={false}
-                  />
-                ) : (
-                  <div className="absolute inset-0 overflow-auto p-6">
-                    <JsonViewer data={parsedOutput} />
+          ) : (
+            <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+              
+              {/* JSON Result Card */}
+              <div className="xl:col-span-2 flex flex-col gap-3">
+                <div className="flex items-center justify-between">
+                  <h2 className="text-lg font-semibold flex items-center gap-2">
+                    <Braces size={18} className="text-indigo-400" />
+                    Structured Data
+                  </h2>
+                  <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-1 bg-zinc-900 p-1 rounded-lg border border-zinc-800">
+                      <button
+                        onClick={() => setJsonViewMode('viewer')}
+                        disabled={!jsonResult.data}
+                        className={`px-3 py-1.5 rounded-md text-xs font-medium flex items-center gap-2 transition-colors ${
+                          jsonViewMode === 'viewer' 
+                            ? 'bg-zinc-800 text-zinc-100 shadow-sm' 
+                            : 'text-zinc-500 hover:text-zinc-300 disabled:opacity-50 disabled:cursor-not-allowed'
+                        }`}
+                      >
+                        <ListTree size={14} />
+                        Viewer
+                      </button>
+                      <button
+                        onClick={() => setJsonViewMode('raw')}
+                        className={`px-3 py-1.5 rounded-md text-xs font-medium flex items-center gap-2 transition-colors ${
+                          jsonViewMode === 'raw' 
+                            ? 'bg-zinc-800 text-zinc-100 shadow-sm' 
+                            : 'text-zinc-500 hover:text-zinc-300'
+                        }`}
+                      >
+                        <Code2 size={14} />
+                        Raw
+                      </button>
+                    </div>
+                    <button
+                      onClick={handleCopyJson}
+                      disabled={!jsonResult.raw}
+                      className="p-2 text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2 text-xs font-medium"
+                    >
+                      {copied ? <Check size={16} className="text-emerald-400" /> : <Copy size={16} />}
+                    </button>
                   </div>
-                )}
-              </>
-            ) : (
-              <div className="absolute inset-0 flex items-center justify-center text-zinc-600 text-sm font-mono">
-                // Output will appear here
+                </div>
+                
+                <div className="bg-[#0d0d0d] border border-zinc-800 rounded-xl overflow-hidden relative min-h-[300px]">
+                  {jsonResult.isLoading ? (
+                    <div className="absolute inset-0 flex flex-col items-center justify-center text-zinc-500 gap-3 bg-zinc-950/50 backdrop-blur-sm z-10">
+                      <Loader2 size={24} className="animate-spin text-indigo-500" />
+                      <span className="text-sm font-medium">Extracting data & searching web...</span>
+                    </div>
+                  ) : jsonResult.error ? (
+                    <div className="absolute inset-0 flex items-center justify-center p-6 text-red-400 text-sm text-center">
+                      {jsonResult.error}
+                    </div>
+                  ) : jsonResult.raw ? (
+                    <div className="absolute inset-0 overflow-auto p-6">
+                      {jsonViewMode === 'raw' ? (
+                        <textarea
+                          value={jsonResult.raw}
+                          onChange={(e) => {
+                            setJsonResult(prev => ({ ...prev, raw: e.target.value }));
+                            try {
+                              const parsed = JSON.parse(e.target.value);
+                              setJsonResult(prev => ({ ...prev, data: parsed }));
+                            } catch (err) {}
+                          }}
+                          className="w-full h-full bg-transparent text-sm font-mono text-zinc-300 resize-none focus:outline-none"
+                          spellCheck={false}
+                        />
+                      ) : (
+                        <JsonViewer data={jsonResult.data} />
+                      )}
+                    </div>
+                  ) : null}
+                </div>
               </div>
-            )}
-          </div>
+
+              {/* Image Result Card */}
+              <div className="flex flex-col gap-3">
+                <h2 className="text-lg font-semibold flex items-center gap-2">
+                  <ImageIcon size={18} className="text-emerald-400" />
+                  Generated Image
+                </h2>
+                <div className="bg-[#0d0d0d] border border-zinc-800 rounded-xl overflow-hidden relative aspect-square flex items-center justify-center">
+                  {imageResult.isLoading ? (
+                    <div className="flex flex-col items-center justify-center text-zinc-500 gap-3">
+                      <Loader2 size={24} className="animate-spin text-emerald-500" />
+                      <span className="text-sm font-medium">Painting image...</span>
+                    </div>
+                  ) : imageResult.error ? (
+                    <div className="p-6 text-red-400 text-sm text-center">
+                      {imageResult.error}
+                    </div>
+                  ) : imageResult.url ? (
+                    <img src={imageResult.url} alt="Generated" className="w-full h-full object-cover" />
+                  ) : (
+                    <span className="text-zinc-600 text-sm">Waiting for generation...</span>
+                  )}
+                </div>
+              </div>
+
+              {/* Video Result Card */}
+              <div className="flex flex-col gap-3">
+                <h2 className="text-lg font-semibold flex items-center gap-2">
+                  <Film size={18} className="text-purple-400" />
+                  Generated Video
+                </h2>
+                <div className="bg-[#0d0d0d] border border-zinc-800 rounded-xl overflow-hidden relative aspect-square flex items-center justify-center">
+                  {videoResult.isLoading ? (
+                    <div className="flex flex-col items-center justify-center text-zinc-500 gap-3">
+                      <Loader2 size={24} className="animate-spin text-purple-500" />
+                      <span className="text-sm font-medium">Rendering video (takes a few mins)...</span>
+                    </div>
+                  ) : videoResult.error ? (
+                    <div className="p-6 text-red-400 text-sm text-center">
+                      {videoResult.error}
+                    </div>
+                  ) : videoResult.url ? (
+                    <video src={videoResult.url} controls autoPlay loop className="w-full h-full object-cover" />
+                  ) : (
+                    <span className="text-zinc-600 text-sm">Waiting for generation...</span>
+                  )}
+                </div>
+              </div>
+
+            </div>
+          )}
         </div>
 
       </main>
