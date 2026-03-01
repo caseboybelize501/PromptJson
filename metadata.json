@@ -1,0 +1,5 @@
+{
+  "name": "Prompt to JSON",
+  "description": "A tool to generate structured JSON from text prompts using Gemini.",
+  "requestFramePermissions": []
+}
